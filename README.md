@@ -14,8 +14,10 @@ Adaptive layout based on terminal width:
 - **Right:** 🌿 git branch
 
 On a wide terminal it's a single line with three zones; on a narrow one it wraps to two lines
-automatically; on a very narrow one the branch name is truncated. Bar colors shift as you
-approach the limit (green → yellow → red).
+automatically (left zone + branch on top, limits below). As width shrinks further the limits
+block collapses gracefully — it drops the reset countdowns, then the bars, and in a very narrow
+window each limit becomes a single colored dot. Colors shift as you approach the limit
+(green → yellow → red).
 
 The limits (`rate_limits.five_hour` / `.seven_day`) arrive on stdin from Claude Code v2.1.x+
 for Pro/Max subscribers and appear after the first API response in a session.
