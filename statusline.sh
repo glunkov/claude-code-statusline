@@ -3,13 +3,59 @@
 #   Left:   [Model] · 💰 cost · ⏱ session
 #   Center: 🧠 context · ⚡5h limit · 📅7d limit
 #   Right:  🌿 branch
-# Reads ONLY stdin (JSON from Claude Code). No network, no credential access.
+# Reads stdin (JSON from Claude Code). No network. The only files touched are the
+# Claude config files, and only their `.theme` key — never any secrets.
 
 input=$(cat)
 
-# Colors.
-GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; CYAN='\033[36m'; DIM='\033[2m'; RESET='\033[0m'
-SEP=" ${DIM}·${RESET} "
+# ---- Theme: light | dark (dark is the safe fallback). ----
+# stdin carries no theme and Claude Code exports no theme env var, so resolve via:
+#   1. CLAUDE_STATUSLINE_THEME override (light|dark|auto)
+#   2. explicit `.theme` from ~/.claude/settings.json then ~/.claude.json (light*/dark*)
+#   3. COLORFGBG (last field is the bg index: 7 or 9..15 = light, else dark)
+#   4. fallback: dark
+classify() {   # map a raw theme string → light|dark|"" (unknown/auto)
+  case "$1" in
+    light*) echo light ;;
+    dark*)  echo dark ;;
+    *)      echo "" ;;
+  esac
+}
+resolve_theme() {
+  local t f
+  t=$(classify "${CLAUDE_STATUSLINE_THEME:-}")          # 1. explicit override
+  [ -n "$t" ] && { echo "$t"; return; }
+  for f in "$HOME/.claude/settings.json" "$HOME/.claude.json"; do   # 2. only the .theme key
+    [ -r "$f" ] || continue
+    t=$(classify "$(jq -r '.theme // empty' "$f" 2>/dev/null)")
+    [ -n "$t" ] && { echo "$t"; return; }
+  done
+  if [ -n "${COLORFGBG:-}" ]; then                       # 3. terminal-reported background
+    case "${COLORFGBG##*;}" in
+      7|9|10|11|12|13|14|15) echo light; return ;;
+      [0-9]*)                echo dark;  return ;;
+    esac
+  fi
+  echo dark                                             # 4. fallback
+}
+THEME=$(resolve_theme)
+
+# ---- Palette: 256-color mid-tones, chosen to stay legible even on the "wrong"
+# background if detection guesses incorrectly. Light themes use darker, white-legible
+# colors; dark themes use brighter ones. No background band (BAND stays empty), but
+# emit() still honors $BAND if it is ever set again. ----
+RESET='\033[0m'      # full reset — ONLY at the very end of an emitted line.
+SR='\033[39m'        # soft reset — restore default fg but KEEP the background band.
+if [ "$THEME" = light ]; then
+  NEU='\033[38;5;240m'; ACC='\033[38;5;25m'
+  C_GRN='\033[38;5;28m'; C_YEL='\033[38;5;166m'; C_RED='\033[38;5;160m'
+  BAND=''                        # no background band — just the darker, white-legible palette.
+else
+  NEU='\033[38;5;245m'; ACC='\033[38;5;44m'
+  C_GRN='\033[38;5;34m'; C_YEL='\033[38;5;214m'; C_RED='\033[38;5;203m'
+  BAND=''                        # no band on dark themes.
+fi
+SEP=" ${NEU}·${SR} "
 WAIT='⏳'                 # placeholder shown in a limit's number slot until its data arrives.
 
 COLS=${COLUMNS:-120}     # width is provided by Claude Code (v2.1.153+).
@@ -38,9 +84,9 @@ vislen() {
 
 # Color by proximity to max: <70 green, 70-89 yellow, 90+ red.
 pct_color() {
-  if   [ "$1" -ge 90 ]; then printf '%b' "$RED"
-  elif [ "$1" -ge 70 ]; then printf '%b' "$YELLOW"
-  else printf '%b' "$GREEN"; fi
+  if   [ "$1" -ge 90 ]; then printf '%b' "$C_RED"
+  elif [ "$1" -ge 70 ]; then printf '%b' "$C_YEL"
+  else printf '%b' "$C_GRN"; fi
 }
 
 # Bar of width 10: bar <percent> (filled).
@@ -74,11 +120,11 @@ NOW=$(date +%s)
 
 # ---- LEFT: model · cost · session ----
 # Strip control chars and backslashes (and cap length) so a hostile display_name
-# can't inject terminal escape sequences through `echo -e` below.
+# can't inject terminal escape sequences through `printf '%b'` below.
 MODEL=$(echo "$input" | jq -r '.model.display_name // "Claude"' | tr -d '\000-\037\\' | cut -c1-40)
 COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 DUR_MS=$(echo "$input" | jq -r '.cost.total_duration_ms // 0' | grep -Eo '^[0-9]+' || echo 0)
-LEFT="${CYAN}[$MODEL]${RESET}${SEP}💰 $(printf '$%.2f' "$COST")${SEP}⏱ session $(fmt_dur $((DUR_MS / 1000)))"
+LEFT="${ACC}[$MODEL]${SR}${SEP}💰 $(printf '$%.2f' "$COST")${SEP}⏱ session $(fmt_dur $((DUR_MS / 1000)))"
 
 # ---- CENTER: context · 5h · 7d ----
 CTX_USED=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | grep -Eo '^[0-9]+' || echo 0)
@@ -98,9 +144,9 @@ build_center() {
   local level=$1 c p seg
   c=$(pct_color "$CTX_USED")
   case "$level" in
-    0|1) CENTER="🧠 ${c}$(bar "$CTX_FREE")${RESET} ${CTX_FREE}% free" ;;
-    2)   CENTER="🧠 ${c}${CTX_FREE}% free${RESET}" ;;
-    *)   CENTER="🧠 ${c}●${RESET}" ;;
+    0|1) CENTER="🧠 ${c}$(bar "$CTX_FREE")${SR} ${CTX_FREE}% free" ;;
+    2)   CENTER="🧠 ${c}${CTX_FREE}% free${SR}" ;;
+    *)   CENTER="🧠 ${c}●${SR}" ;;
   esac
   # Each rate-limit segment renders even before its data arrives: an inactive gray slider plus a
   # waiting marker keeps the layout from jumping when the 5h/7d numbers appear after the first API
@@ -110,16 +156,16 @@ build_center() {
     if [ -n "$raw" ]; then
       p=$(printf '%.0f' "$raw"); c=$(pct_color "$p")
       case "$level" in
-        0|1) seg="$emoji$label ${c}$(bar "$p") ${p}%${RESET}" ;;
-        2)   seg="$emoji$label ${c}${p}%${RESET}" ;;
-        *)   seg="$emoji${c}●${RESET}" ;;
+        0|1) seg="$emoji$label ${c}$(bar "$p") ${p}%${SR}" ;;
+        2)   seg="$emoji$label ${c}${p}%${SR}" ;;
+        *)   seg="$emoji${c}●${SR}" ;;
       esac
-      [ "$level" -eq 0 ] && [ -n "$rat" ] && seg="$seg ${DIM}↻ $(fmt_left $((rat - NOW)))${RESET}"
+      [ "$level" -eq 0 ] && [ -n "$rat" ] && seg="$seg ${NEU}↻ $(fmt_left $((rat - NOW)))${SR}"
     else
       case "$level" in
-        0|1) seg="$emoji$label ${DIM}$(bar 0) ${WAIT}${RESET}" ;;   # gray empty slider + waiting marker
-        2)   seg="$emoji$label ${DIM}${WAIT}${RESET}" ;;
-        *)   seg="$emoji${DIM}●${RESET}" ;;
+        0|1) seg="$emoji$label ${NEU}$(bar 0) ${WAIT}${SR}" ;;   # gray empty slider + waiting marker
+        2)   seg="$emoji$label ${NEU}${WAIT}${SR}" ;;
+        *)   seg="$emoji${NEU}●${SR}" ;;
       esac
     fi
     CENTER="$CENTER$SEP$seg"
@@ -141,11 +187,11 @@ set_branch() {
   local maxcols=$1 keep
   [ -z "$BFULL" ] && { RIGHT=""; WR=0; return; }
   if [ $(( ${#BFULL} + 3 )) -le "$maxcols" ]; then
-    RIGHT="${DIM}🌿 ${BFULL}${RESET}"
+    RIGHT="${NEU}🌿 ${BFULL}${SR}"
   else
     keep=$(( maxcols - 4 ))        # "🌿 " (3 cols) + "…" (1 col)
     [ "$keep" -lt 1 ] && keep=1
-    RIGHT="${DIM}🌿 ${BFULL:0:$keep}…${RESET}"
+    RIGHT="${NEU}🌿 ${BFULL:0:$keep}…${SR}"
   fi
   WR=$(vislen "$RIGHT")
 }
@@ -154,6 +200,19 @@ set_branch "$MAXBR"   # global cap: a long branch never dominates the line.
 
 AVAIL=$((COLS - RMARGIN))
 WL=$(vislen "$LEFT")
+
+# Emit one composed line. If $BAND is set, pad the line to the full working width and wrap
+# it in that background so it reads as one rectangular card; both themes currently leave
+# $BAND empty, so the line is printed as-is.
+emit() {
+  local content=$1 w padn
+  if [ -n "$BAND" ]; then
+    w=$(vislen "$content"); padn=$(( AVAIL - w )); [ "$padn" -lt 0 ] && padn=0
+    printf '%b\n' "${BAND}${content}$(rep "$padn")${RESET}"
+  else
+    printf '%b\n' "${content}${RESET}"
+  fi
+}
 
 # Attempt 1: single line — left zone, limits, branch laid out left-to-right.
 # Rules:
@@ -178,7 +237,7 @@ if [ "$GAP" -ge $(( WC + 2 )) ]; then
     [ "$P1" -lt 2 ] && P1=2
   fi
   P2=$(( gaps - P1 ))                     # right pad takes the rest; shrinks as the branch grows.
-  echo -e "${LEFT}$(rep $P1)${CENTER}$(rep $P2)${RIGHT}"
+  emit "${LEFT}$(rep $P1)${CENTER}$(rep $P2)${RIGHT}"
   exit 0
 fi
 
@@ -202,5 +261,5 @@ LINE1="$LEFT"
 if [ -n "$RIGHT" ] && [ "$WR" -le "$room" ]; then
   LINE1="${LEFT}$(rep $(( room - WR )))${RIGHT}"
 fi
-echo -e "$LINE1"
-echo -e "$CENTER"                      # limits left-aligned, directly under the left zone
+emit "$LINE1"
+emit "$CENTER"                         # limits left-aligned, directly under the left zone
